@@ -34,14 +34,17 @@ fastify.register(cors, {
 
 // Register Cookie and Session
 fastify.register(cookie);
+const isProduction = process.env.NODE_ENV === 'production';
+
 fastify.register(session, {
   secret: process.env.SESSION_SECRET || 'a-very-secret-key-at-least-32-characters-long',
   cookieName: 'voice_app_session',
-  saveUninitialized: false,
+  saveUninitialized: true,
   cookie: { 
-    secure: false, 
-    sameSite: 'lax',
-    path: '/'
+    secure: isProduction,          // true trên HTTPS (production), false trên localhost
+    sameSite: isProduction ? 'none' : 'lax',  // 'none' cho cross-origin, 'lax' cho localhost
+    path: '/',
+    maxAge: 24 * 60 * 60 * 1000,   // 24 giờ
   }
 });
 
