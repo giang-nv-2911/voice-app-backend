@@ -9,6 +9,7 @@ import prisma from './lib/prisma.js';
 
 const fastify: FastifyInstance = Fastify({
   logger: true,
+  trustProxy: true,  // Railway/Render chạy sau reverse proxy, cần bật để nhận đúng HTTPS
 });
 
 // Extend Fastify types to include session user
