@@ -1,0 +1,62 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id         String   @id @db.VarChar(191)
+  email      String   @unique
+  name       String?
+  picture    String?  @db.Text
+  created_at DateTime @default(now())
+  debts      Debt[]
+
+  @@map("users")
+}
+
+model Debt {
+  id           Int      @id @default(autoincrement())
+  user_id      String   @db.VarChar(191)
+  debtor_name  String
+  amount       Decimal  @db.Decimal(15, 2)
+  description  String?  @db.Text
+  date         DateTime @db.Date
+  type         DebtType
+  status       Status   @default(pending)
+  transcript   String?  @db.Text
+  created_at   DateTime @default(now())
+  user         User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("debts")
+}
+
+model DeletedDebt {
+  id           Int      @id @default(autoincrement())
+  original_id  Int
+  user_id      String   @db.VarChar(191)
+  debtor_name  String
+  amount       Decimal  @db.Decimal(15, 2)
+  description  String?  @db.Text
+  date         DateTime @db.Date
+  type         DebtType
+  status       Status
+  transcript   String?  @db.Text
+  created_at   DateTime
+  deleted_at   DateTime @default(now())
+
+  @@map("deleted_debts")
+}
+
+enum DebtType {
+  lend
+  borrow
+}
+
+enum Status {
+  pending
+  paid
+}
