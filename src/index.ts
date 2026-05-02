@@ -77,7 +77,7 @@ fastify.register(oauth2, {
     },
   },
   startRedirectPath: '/login/google',
-  callbackUri: 'http://localhost:4000/api/auth/callback/google'
+  callbackUri: process.env.CALLBACK_URL || 'http://localhost:4000/api/auth/callback/google'
 } as any);
 
 // Routes
