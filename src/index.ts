@@ -149,6 +149,62 @@ fastify.get('/logout', async (request, reply) => {
 });
 
 // DEBT APIs
+
+// Get only pending (active) debts for a debtor
+fastify.get('/api/debts/pending/:debtor', async (request, reply) => {
+  const { user } = request.session;
+  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
+
+  const { debtor } = request.params as { debtor: string };
+
+  const debts = await prisma.debt.findMany({
+    where: {
+      user_id: user.id,
+      debtor_name: debtor,
+      status: 'pending',
+      type: 'lend' 
+    },
+    orderBy: { created_at: 'desc' }
+  });
+
+  return debts.map(d => ({
+    id: d.id,
+    nguoi_no: d.debtor_name,
+    so_tien: Number(d.amount),
+    noi_dung: d.description,
+    ngay: d.date.toISOString().split('T')[0],
+    loai: 'no'
+  }));
+});
+
+// Process Repayment
+fastify.post('/api/debts/repay', async (request, reply) => {
+  const { user } = request.session;
+  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
+
+  const { debtor_name, amount, transcript, date, description } = request.body as any;
+
+  try {
+    // LEDGER MODEL: Just create a single repayment record without modifying previous ones.
+    await prisma.debt.create({
+      data: {
+        user_id: user.id,
+        debtor_name,
+        amount: amount, 
+        description: description || `Trả nợ ${amount.toLocaleString()}đ`,
+        date: new Date(date),
+        type: 'borrow',
+        status: 'pending', 
+        transcript: transcript ?? null
+      }
+    });
+    return { success: true };
+  } catch (err: any) {
+    fastify.log.error(err);
+    return reply.status(500).send({ error: 'Repayment failed' });
+  }
+});
+
 fastify.get('/api/debts', async (request, reply) => {
   const user = request.session.user;
   if (!user) return reply.status(401).send({ error: 'Unauthorized' });
