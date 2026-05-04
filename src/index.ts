@@ -325,7 +325,7 @@ fastify.post('/api/debts/trash/restore/:id', async (request, reply) => {
     const trashId = parseInt(id);
     
     const restored = await prisma.$transaction(async (tx) => {
-      const deleted = await tx.deletedDebt.findUnique({
+      const deleted = await tx.deletedDebt.findFirst({
         where: { id: trashId, user_id: user.id }
       });
       
@@ -412,6 +412,119 @@ fastify.delete('/api/debts/debtor/:name', async (request, reply) => {
   } catch (err: any) {
     fastify.log.error(err);
     return reply.status(500).send({ error: 'Bulk archive failed', message: err.message });
+  }
+});
+fastify.delete('/api/debts/purge', async (request, reply) => {
+  const user = request.session.user;
+  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
+
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      const debts = await tx.debt.findMany({
+        where: { user_id: user.id }
+      });
+
+      if (debts.length === 0) return { count: 0 };
+
+      // 1. Copy all to DeletedDebt
+      await tx.deletedDebt.createMany({
+        data: debts.map(d => ({
+          original_id: d.id,
+          user_id: d.user_id,
+          debtor_name: d.debtor_name,
+          amount: d.amount,
+          description: d.description,
+          date: d.date,
+          type: d.type,
+          status: d.status,
+          transcript: d.transcript,
+          created_at: d.created_at,
+        }))
+      });
+
+      // 2. Delete all from Debt
+      const deleted = await tx.debt.deleteMany({
+        where: { user_id: user.id }
+      });
+
+      return deleted;
+    });
+
+    return { success: true, ...result };
+  } catch (err: any) {
+    fastify.log.error(err);
+    return reply.status(500).send({ error: 'Soft purge failed', message: err.message });
+  }
+});
+
+fastify.post('/api/debts/trash/restore-bulk', async (request, reply) => {
+  const user = request.session.user;
+  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
+
+  const { ids } = request.body as { ids: number[] };
+  if (!ids?.length) return reply.status(400).send({ error: 'No IDs provided' });
+
+  try {
+    const restored = await prisma.$transaction(async (tx) => {
+      const restoredRecords = [];
+      
+      for (const id of ids) {
+        const deleted = await tx.deletedDebt.findFirst({
+          where: { id, user_id: user.id }
+        });
+        
+        if (!deleted) continue;
+
+        const restoredDebt = await tx.debt.create({
+          data: {
+            user_id: deleted.user_id,
+            debtor_name: deleted.debtor_name,
+            amount: deleted.amount,
+            description: deleted.description,
+            date: deleted.date,
+            type: deleted.type,
+            status: deleted.status,
+            transcript: deleted.transcript,
+            created_at: deleted.created_at,
+          }
+        });
+
+        await tx.deletedDebt.delete({
+          where: { id }
+        });
+        
+        restoredRecords.push(restoredDebt);
+      }
+      
+      return restoredRecords;
+    });
+
+    return { success: true, count: restored.length };
+  } catch (err: any) {
+    fastify.log.error(err);
+    return reply.status(500).send({ error: 'Bulk restore failed', message: err.message });
+  }
+});
+
+fastify.delete('/api/debts/trash/bulk', async (request, reply) => {
+  const user = request.session.user;
+  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
+
+  const { ids } = request.body as { ids: number[] };
+  if (!ids?.length) return reply.status(400).send({ error: 'No IDs provided' });
+
+  try {
+    const result = await prisma.deletedDebt.deleteMany({
+      where: {
+        id: { in: ids },
+        user_id: user.id
+      }
+    });
+
+    return { success: true, count: result.count };
+  } catch (err: any) {
+    fastify.log.error(err);
+    return reply.status(500).send({ error: 'Bulk delete failed', message: err.message });
   }
 });
 
