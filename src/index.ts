@@ -45,7 +45,7 @@ fastify.register(session, {
     secure: isProduction,          // true trên HTTPS (production), false trên localhost
     sameSite: isProduction ? 'none' : 'lax',  // 'none' cho cross-origin, 'lax' cho localhost
     path: '/',
-    maxAge: 24 * 60 * 60 * 1000,   // 24 giờ
+    maxAge: 30 * 24 * 60 * 60 * 1000,   // 30 ngày (1 tháng)
   }
 });
 
