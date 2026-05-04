@@ -4,48 +4,55 @@ import oauth2 from '@fastify/oauth2';
 import cookie from '@fastify/cookie';
 import session from '@fastify/session';
 import cors from '@fastify/cors';
+import jwt from '@fastify/jwt';
 import axios from 'axios';
 import prisma from './lib/prisma.js';
 
 const fastify: FastifyInstance = Fastify({
   logger: true,
-  trustProxy: true,  // Railway/Render chạy sau reverse proxy, cần bật để nhận đúng HTTPS
+  trustProxy: true,
 });
 
-// Extend Fastify types to include session user
+// Extend Fastify types
 declare module 'fastify' {
-  interface Session {
-    user?: {
-      id: string;
-      email: string;
-      name: string;
-      picture: string;
-      [key: string]: any;
-    };
-    oauth_state?: string;
+  interface FastifyInstance {
+    authenticate: any;
   }
 }
+
+// Register JWT
+fastify.register(jwt, {
+  secret: process.env.JWT_SECRET || 'your-extremely-secure-jwt-secret-key-change-it'
+});
+
+// Decorator for Auth
+fastify.decorate("authenticate", async function(request: any, reply: any) {
+  try {
+    await request.jwtVerify();
+  } catch (err) {
+    reply.send(err);
+  }
+});
 
 // Register CORS
 fastify.register(cors, {
   origin: process.env.FRONTEND_URL || 'http://localhost:3000',
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 });
 
-// Register Cookie and Session
+// Session is temporarily kept for internal OAuth state handling if needed
 fastify.register(cookie);
-const isProduction = process.env.NODE_ENV === 'production';
-
 fastify.register(session, {
   secret: process.env.SESSION_SECRET || 'a-very-secret-key-at-least-32-characters-long',
-  cookieName: 'voice_app_session',
-  saveUninitialized: true,
+  cookieName: 'voice_app_oauth_session',
+  saveUninitialized: false,
   cookie: { 
-    secure: isProduction,          // true trên HTTPS (production), false trên localhost
-    sameSite: isProduction ? 'none' : 'lax',  // 'none' cho cross-origin, 'lax' cho localhost
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
     path: '/',
-    maxAge: 30 * 24 * 60 * 60 * 1000,   // 30 ngày (1 tháng)
+    maxAge: 10 * 60 * 1000, 
   }
 });
 
@@ -53,16 +60,6 @@ fastify.register(session, {
 fastify.register(oauth2, {
   name: 'googleOAuth2',
   scope: ['profile', 'email'],
-  generateStateFunction: (_request: any, callback: any) => {
-    // Tạo state ngẫu nhiên nhưng KHÔNG lưu vào session
-    // vì cookie session bị mất khi redirect cross-origin
-    const state = Math.random().toString(36).substring(2);
-    callback(null, state);
-  },
-  checkStateFunction: (_request: any, callback: any) => {
-    // Bỏ qua state validation - Google đã tự bảo vệ bằng redirect_uri
-    callback();
-  },
   credentials: {
     client: {
       id: process.env.GOOGLE_CLIENT_ID || '',
@@ -76,7 +73,14 @@ fastify.register(oauth2, {
     },
   },
   startRedirectPath: '/login/google',
-  callbackUri: process.env.CALLBACK_URL || 'http://localhost:4000/api/auth/callback/google'
+  callbackUri: process.env.CALLBACK_URL || 'http://localhost:4000/api/auth/callback/google',
+  generateStateFunction: (_request: any, callback: any) => {
+    const state = Math.random().toString(36).substring(2);
+    callback(null, state);
+  },
+  checkStateFunction: (_request: any, callback: any) => {
+    callback();
+  },
 } as any);
 
 // Routes
@@ -87,14 +91,10 @@ fastify.get('/api/auth/callback/google', async function (request, reply) {
     // @ts-ignore
     const { token } = await this.googleOAuth2.getAccessTokenFromAuthorizationCodeFlow(request);
     
-    fastify.log.info('Token acquired successfully');
-    
-    // Get user info from Google
     const { data: googleUser } = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
       headers: { Authorization: `Bearer ${token.access_token}` },
     });
 
-    // UPSERT User into Database
     const user = await prisma.user.upsert({
       where: { id: googleUser.id },
       update: {
@@ -110,51 +110,35 @@ fastify.get('/api/auth/callback/google', async function (request, reply) {
       },
     });
 
-    fastify.log.info(`User authenticated and saved: ${user.email}`);
-
-    // Save user to session
-    request.session.user = {
+    // Generate JWT Token
+    const jwtToken = fastify.jwt.sign({
       id: user.id,
       email: user.email,
       name: user.name || '',
       picture: user.picture || '',
-    };
+    }, {
+      expiresIn: '30d' // Token hết hạn sau 30 ngày
+    });
 
-    // Redirect to frontend
-    reply.redirect(process.env.FRONTEND_URL || 'http://localhost:3000');
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    reply.redirect(`${frontendUrl}?token=${jwtToken}`);
   } catch (err: any) {
-    fastify.log.error('OAuth Error Detail:');
-    fastify.log.error(err);
-    if (err.response) {
-      fastify.log.error(err.response.data);
-    }
+    fastify.log.error('OAuth Error:', err);
     reply.status(500).send({ 
-      error: 'Authentication failed', 
-      message: err.message,
-      detail: err.response?.data 
+       error: 'Authentication failed', 
+       message: err.message,
+       detail: err.response?.data
     });
   }
 });
 
-fastify.get('/api/me', async (request, reply) => {
-  if (!request.session.user) {
-    return reply.status(401).send({ error: 'Unauthorized' });
-  }
-  return request.session.user;
-});
-
-fastify.get('/logout', async (request, reply) => {
-  request.session.destroy();
-  reply.send({ success: true });
+fastify.get('/api/me', { preHandler: [fastify.authenticate] }, async (request) => {
+  return request.user;
 });
 
 // DEBT APIs
-
-// Get only pending (active) debts for a debtor
-fastify.get('/api/debts/pending/:debtor', async (request, reply) => {
-  const { user } = request.session;
-  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
-
+fastify.get('/api/debts/pending/:debtor', { preHandler: [fastify.authenticate] }, async (request) => {
+  const user = request.user as any;
   const { debtor } = request.params as { debtor: string };
 
   const debts = await prisma.debt.findMany({
@@ -177,15 +161,11 @@ fastify.get('/api/debts/pending/:debtor', async (request, reply) => {
   }));
 });
 
-// Process Repayment
-fastify.post('/api/debts/repay', async (request, reply) => {
-  const { user } = request.session;
-  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
-
+fastify.post('/api/debts/repay', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  const user = request.user as any;
   const { debtor_name, amount, transcript, date, description } = request.body as any;
 
   try {
-    // LEDGER MODEL: Just create a single repayment record without modifying previous ones.
     await prisma.debt.create({
       data: {
         user_id: user.id,
@@ -200,30 +180,23 @@ fastify.post('/api/debts/repay', async (request, reply) => {
     });
     return { success: true };
   } catch (err: any) {
-    fastify.log.error(err);
     return reply.status(500).send({ error: 'Repayment failed' });
   }
 });
 
-fastify.get('/api/debts', async (request, reply) => {
-  const user = request.session.user;
-  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
-
-  const debts = await prisma.debt.findMany({
+fastify.get('/api/debts', { preHandler: [fastify.authenticate] }, async (request) => {
+  const user = request.user as any;
+  return await prisma.debt.findMany({
     where: { user_id: user.id },
     orderBy: { date: 'desc' },
   });
-  return debts;
 });
 
-fastify.post('/api/debts', async (request, reply) => {
-  const user = request.session.user;
-  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
-
+fastify.post('/api/debts', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  const user = request.user as any;
   const { debtor_name, amount, description, date, type, transcript } = request.body as any;
-
   try {
-    const debt = await prisma.debt.create({
+    return await prisma.debt.create({
       data: {
         user_id: user.id,
         debtor_name,
@@ -234,49 +207,34 @@ fastify.post('/api/debts', async (request, reply) => {
         transcript,
       },
     });
-    return debt;
   } catch (err: any) {
-    fastify.log.error(err);
-    return reply.status(500).send({ error: 'Failed to create debt record', message: err.message });
+    return reply.status(500).send({ error: 'Failed to create debt record' });
   }
 });
 
-fastify.patch('/api/debts/:id', async (request, reply) => {
-  const user = request.session.user;
-  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
-
+fastify.patch('/api/debts/:id', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  const user = request.user as any;
   const { id } = request.params as any;
   const { status } = request.body as any;
-
   try {
-    const debt = await prisma.debt.update({
+    return await prisma.debt.update({
       where: { id: parseInt(id), user_id: user.id },
       data: { status },
     });
-    return debt;
   } catch (err: any) {
-    fastify.log.error(err);
     return reply.status(500).send({ error: 'Update failed' });
   }
 });
 
-fastify.delete('/api/debts/:id', async (request, reply) => {
-  const user = request.session.user;
-  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
-
+fastify.delete('/api/debts/:id', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  const user = request.user as any;
   const { id } = request.params as any;
   try {
     const debtId = parseInt(id);
-    
-    // 1. Transaction: Copy to DeletedDebt THEN Delete from Debt
-    const result = await prisma.$transaction(async (tx) => {
-      const debt = await tx.debt.findUnique({
-        where: { id: debtId, user_id: user.id }
-      });
-      
+    return await prisma.$transaction(async (tx) => {
+      const debt = await tx.debt.findUnique({ where: { id: debtId, user_id: user.id } });
       if (!debt) throw new Error('Debt not found');
-
-      const archived = await tx.deletedDebt.create({
+      await tx.deletedDebt.create({
         data: {
           original_id: debt.id,
           user_id: debt.user_id,
@@ -290,143 +248,83 @@ fastify.delete('/api/debts/:id', async (request, reply) => {
           created_at: debt.created_at,
         }
       });
-
-      await tx.debt.delete({
-        where: { id: debtId }
-      });
-
-      return archived;
+      await tx.debt.delete({ where: { id: debtId } });
+      return { success: true };
     });
-
-    return { success: true, archived: result };
   } catch (err: any) {
-    fastify.log.error(err);
-    return reply.status(500).send({ error: 'Archive failed', message: err.message });
+    return reply.status(500).send({ error: 'Archive failed' });
   }
 });
 
-fastify.get('/api/debts/trash', async (request, reply) => {
-  const user = request.session.user;
-  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
-
-  const deletedDebts = await prisma.deletedDebt.findMany({
+fastify.get('/api/debts/trash', { preHandler: [fastify.authenticate] }, async (request) => {
+  const user = request.user as any;
+  return await prisma.deletedDebt.findMany({
     where: { user_id: user.id },
     orderBy: { deleted_at: 'desc' },
   });
-  return deletedDebts;
 });
 
-fastify.post('/api/debts/trash/restore/:id', async (request, reply) => {
-  const user = request.session.user;
-  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
-
-  const { id } = request.params as any;
+fastify.post('/api/debts/trash/restore-bulk', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  const user = request.user as any;
+  const { ids } = request.body as { ids: number[] };
   try {
-    const trashId = parseInt(id);
-    
     const restored = await prisma.$transaction(async (tx) => {
-      const deleted = await tx.deletedDebt.findFirst({
-        where: { id: trashId, user_id: user.id }
-      });
-      
-      if (!deleted) throw new Error('Deleted record not found');
-
-      const restoredDebt = await tx.debt.create({
-        data: {
-          user_id: deleted.user_id,
-          debtor_name: deleted.debtor_name,
-          amount: deleted.amount,
-          description: deleted.description,
-          date: deleted.date,
-          type: deleted.type,
-          status: deleted.status,
-          transcript: deleted.transcript,
-          created_at: deleted.created_at,
-        }
-      });
-
-      await tx.deletedDebt.delete({
-        where: { id: trashId }
-      });
-
-      return restoredDebt;
+      const restoredRecords = [];
+      for (const id of ids) {
+        const deleted = await tx.deletedDebt.findFirst({ where: { id, user_id: user.id } });
+        if (!deleted) continue;
+        const restoredDebt = await tx.debt.create({
+          data: {
+            user_id: deleted.user_id,
+            debtor_name: deleted.debtor_name,
+            amount: deleted.amount,
+            description: deleted.description,
+            date: deleted.date,
+            type: deleted.type,
+            status: deleted.status,
+            transcript: deleted.transcript,
+            created_at: deleted.created_at,
+          }
+        });
+        await tx.deletedDebt.delete({ where: { id } });
+        restoredRecords.push(restoredDebt);
+      }
+      return restoredRecords;
     });
-
-    return restored;
+    return { success: true, count: restored.length };
   } catch (err: any) {
-    fastify.log.error(err);
-    return reply.status(500).send({ error: 'Restore failed', message: err.message });
+    return reply.status(500).send({ error: 'Bulk restore failed' });
   }
 });
 
-fastify.get('/api/debts/stats', async (request, reply) => {
-  const user = request.session.user;
-  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
+fastify.delete('/api/debts/trash/bulk', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  const user = request.user as any;
+  const { ids } = request.body as { ids: number[] };
+  try {
+    const result = await prisma.deletedDebt.deleteMany({
+      where: { id: { in: ids }, user_id: user.id }
+    });
+    return { success: true, count: result.count };
+  } catch (err: any) {
+    return reply.status(500).send({ error: 'Bulk delete failed' });
+  }
+});
 
-  const stats = await prisma.debt.groupBy({
+fastify.get('/api/debts/stats', { preHandler: [fastify.authenticate] }, async (request) => {
+  const user = request.user as any;
+  return await prisma.debt.groupBy({
     by: ['type'],
     where: { user_id: user.id, status: 'pending' },
     _sum: { amount: true },
   });
-
-  return stats;
 });
 
-fastify.delete('/api/debts/debtor/:name', async (request, reply) => {
-  const user = request.session.user;
-  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
-
-  const { name } = request.params as any;
-
+fastify.delete('/api/debts/purge', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  const user = request.user as any;
   try {
     const result = await prisma.$transaction(async (tx) => {
-      const debts = await tx.debt.findMany({
-        where: { user_id: user.id, debtor_name: name }
-      });
-
+      const debts = await tx.debt.findMany({ where: { user_id: user.id } });
       if (debts.length === 0) return { count: 0 };
-
-      const archivedCount = await tx.deletedDebt.createMany({
-        data: debts.map(d => ({
-          original_id: d.id,
-          user_id: d.user_id,
-          debtor_name: d.debtor_name,
-          amount: d.amount,
-          description: d.description,
-          date: d.date,
-          type: d.type,
-          status: d.status,
-          transcript: d.transcript,
-          created_at: d.created_at,
-        }))
-      });
-
-      await tx.debt.deleteMany({
-        where: { user_id: user.id, debtor_name: name }
-      });
-
-      return archivedCount;
-    });
-
-    return { success: true, ...result };
-  } catch (err: any) {
-    fastify.log.error(err);
-    return reply.status(500).send({ error: 'Bulk archive failed', message: err.message });
-  }
-});
-fastify.delete('/api/debts/purge', async (request, reply) => {
-  const user = request.session.user;
-  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
-
-  try {
-    const result = await prisma.$transaction(async (tx) => {
-      const debts = await tx.debt.findMany({
-        where: { user_id: user.id }
-      });
-
-      if (debts.length === 0) return { count: 0 };
-
-      // 1. Copy all to DeletedDebt
       await tx.deletedDebt.createMany({
         data: debts.map(d => ({
           original_id: d.id,
@@ -441,94 +339,14 @@ fastify.delete('/api/debts/purge', async (request, reply) => {
           created_at: d.created_at,
         }))
       });
-
-      // 2. Delete all from Debt
-      const deleted = await tx.debt.deleteMany({
-        where: { user_id: user.id }
-      });
-
-      return deleted;
+      return await tx.debt.deleteMany({ where: { user_id: user.id } });
     });
-
     return { success: true, ...result };
   } catch (err: any) {
-    fastify.log.error(err);
-    return reply.status(500).send({ error: 'Soft purge failed', message: err.message });
+    return reply.status(500).send({ error: 'Soft purge failed' });
   }
 });
 
-fastify.post('/api/debts/trash/restore-bulk', async (request, reply) => {
-  const user = request.session.user;
-  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
-
-  const { ids } = request.body as { ids: number[] };
-  if (!ids?.length) return reply.status(400).send({ error: 'No IDs provided' });
-
-  try {
-    const restored = await prisma.$transaction(async (tx) => {
-      const restoredRecords = [];
-      
-      for (const id of ids) {
-        const deleted = await tx.deletedDebt.findFirst({
-          where: { id, user_id: user.id }
-        });
-        
-        if (!deleted) continue;
-
-        const restoredDebt = await tx.debt.create({
-          data: {
-            user_id: deleted.user_id,
-            debtor_name: deleted.debtor_name,
-            amount: deleted.amount,
-            description: deleted.description,
-            date: deleted.date,
-            type: deleted.type,
-            status: deleted.status,
-            transcript: deleted.transcript,
-            created_at: deleted.created_at,
-          }
-        });
-
-        await tx.deletedDebt.delete({
-          where: { id }
-        });
-        
-        restoredRecords.push(restoredDebt);
-      }
-      
-      return restoredRecords;
-    });
-
-    return { success: true, count: restored.length };
-  } catch (err: any) {
-    fastify.log.error(err);
-    return reply.status(500).send({ error: 'Bulk restore failed', message: err.message });
-  }
-});
-
-fastify.delete('/api/debts/trash/bulk', async (request, reply) => {
-  const user = request.session.user;
-  if (!user) return reply.status(401).send({ error: 'Unauthorized' });
-
-  const { ids } = request.body as { ids: number[] };
-  if (!ids?.length) return reply.status(400).send({ error: 'No IDs provided' });
-
-  try {
-    const result = await prisma.deletedDebt.deleteMany({
-      where: {
-        id: { in: ids },
-        user_id: user.id
-      }
-    });
-
-    return { success: true, count: result.count };
-  } catch (err: any) {
-    fastify.log.error(err);
-    return reply.status(500).send({ error: 'Bulk delete failed', message: err.message });
-  }
-});
-
-// Run the server
 const start = async () => {
   try {
     const port = parseInt(process.env.PORT || '4000');
@@ -536,7 +354,6 @@ const start = async () => {
     await fastify.listen({ port, host });
     console.log(`Server listening on ${port}`);
   } catch (err) {
-    fastify.log.error(err);
     process.exit(1);
   }
 };
