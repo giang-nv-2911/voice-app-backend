@@ -35,11 +35,13 @@ fastify.decorate("authenticate", async function(request: any, reply: any) {
 });
 
 // Register CORS
+const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
 fastify.register(cors, {
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: [frontendUrl, frontendUrl.replace(/\/$/, '')], // Chấp nhận cả có và không có dấu /
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'authorization'], // Chấp nhận cả chữ hoa và thường
+  exposedHeaders: ['Authorization']
 });
 
 // Session is temporarily kept for internal OAuth state handling if needed
