@@ -312,6 +312,45 @@ fastify.delete('/api/debts/trash/bulk', { preHandler: [fastify.authenticate] }, 
   }
 });
 
+fastify.delete('/api/debts/debtor/:name', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  const user = request.user as any;
+  const { name } = request.params as any;
+
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      const debts = await tx.debt.findMany({
+        where: { user_id: user.id, debtor_name: name }
+      });
+
+      if (debts.length === 0) return { count: 0 };
+
+      await tx.deletedDebt.createMany({
+        data: debts.map(d => ({
+          original_id: d.id,
+          user_id: d.user_id,
+          debtor_name: d.debtor_name,
+          amount: d.amount,
+          description: d.description,
+          date: d.date,
+          type: d.type,
+          status: d.status,
+          transcript: d.transcript,
+          created_at: d.created_at,
+        }))
+      });
+
+      return await tx.debt.deleteMany({
+        where: { user_id: user.id, debtor_name: name }
+      });
+    });
+
+    return { success: true, ...result };
+  } catch (err: any) {
+    fastify.log.error(err);
+    return reply.status(500).send({ error: 'Bulk archive failed' });
+  }
+});
+
 fastify.get('/api/debts/stats', { preHandler: [fastify.authenticate] }, async (request) => {
   const user = request.user as any;
   return await prisma.debt.groupBy({
